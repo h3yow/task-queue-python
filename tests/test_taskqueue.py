@@ -1,4 +1,4 @@
-"""任务队列行为测试：重复投递、失败重试、租约超时、并发消费、位点与重启。"""
+"""任务队列行为测试：多组独立投递、按组失败/死信、自动消费并发与租约重投。"""
 
 from __future__ import annotations
 
@@ -57,19 +57,22 @@ def test_empty_idempotency_key_rejected(queue: TaskQueue) -> None:
 # ---- 重复投递最终状态一致 ----
 def test_redelivery_after_lease_expiry_is_consistent(queue: TaskQueue) -> None:
     task, _ = queue.submit("k-redeliver", "p")
-    first, fence1 = queue.lease("g", "c1")
-    log_decision(first.task_id, first.attempts, "c1 leased, then crashed without ack")
+    first, s1, fence1 = queue.lease("g", "c1")
+    log_decision(first.task_id, s1.attempts, "c1 leased, then crashed without ack")
     # c1 中断未 ack；租约到期后 c2 可重新投递
     time.sleep(0.06)
-    second, fence2 = queue.lease("g", "c2")
+    second, s2, fence2 = queue.lease("g", "c2")
     assert second.task_id == task.task_id
     assert fence2 > fence1
-    log_decision(second.task_id, second.attempts, f"redelivered fence {fence1}->{fence2}")
+    # 租约到期重投标记为 LEASE_EXPIRED，但不增加业务尝试次数
+    assert s2.failure_reason == FailureReason.LEASE_EXPIRED
+    assert s2.attempts == 0
+    log_decision(second.task_id, s2.attempts, f"redelivered fence {fence1}->{fence2}")
     # 旧租约持有者的 ack 必须被拒绝，最终状态只能由有效租约决定
     with pytest.raises(LeaseConflictError):
         queue.ack(task.task_id, "g", fence1)
     queue.ack(task.task_id, "g", fence2)
-    final = queue.get_task(task.task_id)
+    final = queue.get_state(task.task_id, "g")
     log_decision(final.task_id, final.attempts, f"final status={final.status}")
     assert final.status == TaskStatus.SUCCEEDED
     assert final.attempts == 0
@@ -82,9 +85,9 @@ def test_retry_backoff_and_dead_letter(queue: TaskQueue) -> None:
     for attempt in range(1, 4):
         leased = queue.lease("g", "c1")
         assert leased is not None
-        t, fence = leased
+        t, state, fence = leased
         queue.fail(t.task_id, "g", fence, ValueError(f"boom-{attempt}"))
-        state = queue.get_task(t.task_id)
+        state = queue.get_state(t.task_id, "g")
         log_decision(
             state.task_id, state.attempts,
             f"attempt={attempt} status={state.status} reason={state.failure_reason}",
@@ -98,8 +101,8 @@ def test_retry_backoff_and_dead_letter(queue: TaskQueue) -> None:
         else:
             assert state.status == TaskStatus.DEAD
             assert state.failure_reason == FailureReason.MAX_ATTEMPTS_EXCEEDED
-    dead = queue.dead_letters()
-    assert [t.task_id for t in dead] == [task.task_id]
+    dead = queue.dead_letters("g")
+    assert [s.task_id for s in dead] == [task.task_id]
     assert "ValueError" in dead[0].last_error  # 错误类型可区分
     assert queue.lease("g", "c1") is None  # 死信不再投递
 
@@ -113,7 +116,7 @@ def test_error_normalization() -> None:
     assert normalize_error(err) is err
 
 
-# ---- 并发消费：同一任务不被同时执行 ----
+# ---- 并发消费：同一组内同一任务不被同时执行 ----
 def test_concurrent_consumers_no_double_execution(tmp_path) -> None:
     store = TaskStore(str(tmp_path / "q.db"))
     q = TaskQueue(store, lease_ttl=0.2)
@@ -156,6 +159,10 @@ def test_lease_expiry_redelivers_without_loss(queue: TaskQueue) -> None:
     time.sleep(0.06)
     leased = queue.lease("g", "c2")
     assert leased is not None and leased[0].task_id == task.task_id
+    state = leased[1]
+    # 重投不增加业务尝试次数，判定依据是租约到期而非业务失败
+    assert state.attempts == 0
+    assert state.failure_reason == FailureReason.LEASE_EXPIRED
     log_decision(task.task_id, 0, "lease expired -> redelivered, not lost")
 
 
@@ -176,11 +183,12 @@ def test_restart_preserves_state(tmp_path) -> None:
     db = str(tmp_path / "restart.db")
     q1 = TaskQueue(TaskStore(db))
     task, _ = q1.submit("k-restart", "p")
-    leased, fence = q1.lease("g", "c1")
+    leased, state, fence = q1.lease("g", "c1")
     q1.ack(leased.task_id, "g", fence)  # ack 会自动推进位点到 1
 
     q2 = TaskQueue(TaskStore(db))  # 模拟进程重启
-    restored = q2.get_task(task.task_id)
+    restored_task = q2.get_task(task.task_id)
+    restored = q2.get_state(restored_task.task_id, "g")
     log_decision(restored.task_id, restored.attempts, f"restored status={restored.status}")
     assert restored.status == TaskStatus.SUCCEEDED
     assert q2.get_offset("g") == 1

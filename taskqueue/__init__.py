@@ -8,7 +8,7 @@ from taskqueue.errors import (
     TaskQueueError,
     normalize_error,
 )
-from taskqueue.models import FailureReason, Lease, Task, TaskStatus
+from taskqueue.models import FailureReason, GroupTaskState, Lease, Task, TaskStatus
 from taskqueue.queue import TaskQueue
 from taskqueue.retry import RetryPolicy
 from taskqueue.store import TaskStore
@@ -18,6 +18,7 @@ __all__ = [
     "DeadLetterError",
     "DuplicateTaskError",
     "FailureReason",
+    "GroupTaskState",
     "Lease",
     "LeaseConflictError",
     "OffsetRegressionError",
