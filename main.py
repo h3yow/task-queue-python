@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from taskqueue import RetryPolicy, TaskQueue, TaskQueueError, TaskStore
-from taskqueue.models import Task
-
-app = FastAPI(title="task-queue")
+from taskqueue import (
+    ConsumerService,
+    RetryPolicy,
+    TaskQueue,
+    TaskQueueError,
+    TaskStore,
+)
+from taskqueue.models import GroupTask, Task
 
 _queue = TaskQueue(
     TaskStore(os.environ.get("TASK_QUEUE_DB", "taskqueue.db")),
@@ -23,15 +29,57 @@ _queue = TaskQueue(
     lease_ttl=float(os.environ.get("TASK_QUEUE_LEASE_TTL", "5")),
 )
 
+logger = logging.getLogger("taskqueue.demo")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 自动消费：TASK_QUEUE_AUTO_CONSUME_GROUPS="g1,g2" 时为每个组启动一个后台消费者。
+    # 处理器仅做演示，生产代码应注入自己的业务处理器。
+    groups = [
+        g.strip()
+        for g in os.environ.get("TASK_QUEUE_AUTO_CONSUME_GROUPS", "").split(",")
+        if g.strip()
+    ]
+    services = [
+        ConsumerService(
+            _queue,
+            grp,
+            handler=lambda payload, grp=grp: logger.info(
+                "auto handled group=%s payload=%s", grp, payload
+            ),
+            consumer_id=f"{grp}-auto",
+        )
+        for grp in groups
+    ]
+    for svc in services:
+        svc.start()
+    app.state.auto_services = services
+    yield
+    for svc in services:
+        svc.stop()
+
+
+app = FastAPI(title="task-queue", lifespan=lifespan)
+
 
 def _task_view(t: Task) -> dict:
     return {
         "task_id": t.task_id,
         "idempotency_key": t.idempotency_key,
-        "status": t.status.value,
-        "attempts": t.attempts,
-        "failure_reason": t.failure_reason.value,
-        "last_error": t.last_error,
+        "created_at": t.created_at,
+    }
+
+
+def _group_task_view(g: GroupTask) -> dict:
+    return {
+        "task_id": g.task_id,
+        "group": g.grp,
+        "status": g.status.value,
+        "attempts": g.attempts,
+        "max_attempts": g.max_attempts,
+        "failure_reason": g.failure_reason.value,
+        "last_error": g.last_error,
     }
 
 
@@ -78,8 +126,11 @@ def lease_task(req: LeaseRequest):
     leased = _guard(lambda: _queue.lease(req.group, req.consumer_id))
     if leased is None:
         return {"leased": False}
-    task, fence = leased
-    return {"leased": True, "fence": fence, "task": _task_view(task) | {"payload": task.payload}}
+    gt, fence = leased
+    view = _group_task_view(gt)
+    view["payload"] = gt.payload
+    view["redelivered"] = gt.redelivered
+    return {"leased": True, "fence": fence, "group_task": view}
 
 
 @app.post("/tasks/{task_id}/ack")
@@ -91,7 +142,7 @@ def ack_task(task_id: str, req: SettleRequest):
 @app.post("/tasks/{task_id}/fail")
 def fail_task(task_id: str, req: SettleRequest):
     _guard(lambda: _queue.fail(task_id, req.group, req.fence, RuntimeError(req.error or "failed")))
-    return {"task": _task_view(_queue.get_task(task_id))}
+    return {"group_task": _group_task_view(_queue.get_group_task(task_id, req.group))}
 
 
 @app.get("/tasks/{task_id}")
@@ -99,9 +150,16 @@ def get_task(task_id: str):
     return {"task": _task_view(_guard(lambda: _queue.get_task(task_id)))}
 
 
-@app.get("/dead-letters")
-def dead_letters():
-    return {"dead_letters": [_task_view(t) for t in _queue.dead_letters()]}
+@app.get("/tasks/{task_id}/groups/{group}")
+def get_group_task(task_id: str, group: str):
+    """按组查询处理进度与失败判定。"""
+    gt = _guard(lambda: _queue.get_group_task(task_id, group))
+    return {"group_task": _group_task_view(gt)}
+
+
+@app.get("/groups/{group}/dead-letters")
+def dead_letters(group: str):
+    return {"group": group, "dead_letters": [_group_task_view(g) for g in _queue.dead_letters(group)]}
 
 
 @app.get("/offsets/{group}")

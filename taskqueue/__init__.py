@@ -1,3 +1,4 @@
+from taskqueue.consumer import ConsumerService
 from taskqueue.errors import (
     DeadLetterError,
     DuplicateTaskError,
@@ -8,16 +9,18 @@ from taskqueue.errors import (
     TaskQueueError,
     normalize_error,
 )
-from taskqueue.models import FailureReason, Lease, Task, TaskStatus
+from taskqueue.models import FailureReason, GroupTask, Lease, Task, TaskStatus
 from taskqueue.queue import TaskQueue
 from taskqueue.retry import RetryPolicy
 from taskqueue.store import TaskStore
 from taskqueue.worker import Worker
 
 __all__ = [
+    "ConsumerService",
     "DeadLetterError",
     "DuplicateTaskError",
     "FailureReason",
+    "GroupTask",
     "Lease",
     "LeaseConflictError",
     "OffsetRegressionError",

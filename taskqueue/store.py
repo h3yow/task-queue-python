@@ -1,4 +1,4 @@
-"""基于本地 SQLite 的持久化存储：任务、消费组位点与租约。"""
+"""基于本地 SQLite 的持久化存储：任务、按组处理状态、租约与位点。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import sqlite3
 import threading
 
 from taskqueue.errors import LeaseConflictError, OffsetRegressionError
-from taskqueue.models import FailureReason, Task, TaskStatus
+from taskqueue.models import FailureReason, GroupTask, Task, TaskStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -14,31 +14,47 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id         TEXT NOT NULL UNIQUE,
     idempotency_key TEXT NOT NULL UNIQUE,
     payload         TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER NOT NULL DEFAULT 3,
-    failure_reason  TEXT NOT NULL DEFAULT 'NONE',
-    last_error      TEXT,
-    visible_at      REAL NOT NULL DEFAULT 0,
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL
+    created_at      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_tasks (
+    task_id        TEXT NOT NULL,
+    grp            TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'PENDING',
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    max_attempts   INTEGER NOT NULL DEFAULT 3,
+    failure_reason TEXT NOT NULL DEFAULT 'NONE',
+    last_error     TEXT,
+    visible_at     REAL NOT NULL DEFAULT 0,
+    fence          INTEGER NOT NULL DEFAULT 0,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (task_id, grp)
 );
 CREATE TABLE IF NOT EXISTS leases (
-    task_id     TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL,
     grp         TEXT NOT NULL,
     consumer_id TEXT NOT NULL,
     fence       INTEGER NOT NULL,
-    expires_at  REAL NOT NULL
+    expires_at  REAL NOT NULL,
+    PRIMARY KEY (task_id, grp)
 );
 CREATE TABLE IF NOT EXISTS offsets (
     grp    TEXT PRIMARY KEY,
     offset INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_group_tasks_grp_status
+    ON group_tasks (grp, status);
+CREATE INDEX IF NOT EXISTS idx_leases_grp_expiry
+    ON leases (grp, expires_at);
 """
+
+_TERMINAL = (TaskStatus.SUCCEEDED.value, TaskStatus.DEAD.value)
 
 
 class TaskStore:
-    """SQLite 单文件存储，进程重启后任务与位点不丢失。"""
+    """SQLite 单文件存储，进程重启后任务与各组进度不丢失。"""
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -58,6 +74,14 @@ class TaskStore:
             task_id=row["task_id"],
             idempotency_key=row["idempotency_key"],
             payload=row["payload"],
+            created_at=row["created_at"],
+        )
+
+    def _row_to_group_task(self, row: sqlite3.Row, *, redelivered: bool = False) -> GroupTask:
+        return GroupTask(
+            task_id=row["task_id"],
+            grp=row["grp"],
+            seq=row["seq"],
             status=TaskStatus(row["status"]),
             attempts=row["attempts"],
             max_attempts=row["max_attempts"],
@@ -66,55 +90,48 @@ class TaskStore:
             visible_at=row["visible_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            redelivered=redelivered,
+            payload=row["payload"] if "payload" in row.keys() else "",
         )
-
-    def _get_row(self, task_id: str) -> sqlite3.Row | None:
-        return self._conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
-        ).fetchone()
 
     def _check_lease(self, task_id: str, group: str, fence: int, now: float) -> None:
         row = self._conn.execute(
-            "SELECT * FROM leases WHERE task_id = ?", (task_id,)
+            "SELECT * FROM leases WHERE task_id = ? AND grp = ?",
+            (task_id, group),
         ).fetchone()
         if (
             row is None
-            or row["grp"] != group
             or row["fence"] != fence
             or row["expires_at"] <= now
         ):
             raise LeaseConflictError(
-                f"lease mismatch for task {task_id}: "
-                f"expected fence={fence} group={group}"
+                f"lease mismatch for task {task_id} group {group}: "
+                f"expected fence={fence}"
             )
 
-    # ---- 任务 ----
-    def insert_task(self, task: Task) -> bool:
+    # ---- 任务（共享元数据）----
+    def insert_task(self, task: Task, max_attempts: int) -> bool:
         """按幂等键去重插入；返回是否真正新建。"""
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO tasks
-                   (task_id, idempotency_key, payload, status, attempts,
-                    max_attempts, failure_reason, visible_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (task_id, idempotency_key, payload, max_attempts, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
                 (
                     task.task_id,
                     task.idempotency_key,
                     task.payload,
-                    task.status.value,
-                    task.attempts,
-                    task.max_attempts,
-                    task.failure_reason.value,
-                    task.visible_at,
+                    max_attempts,
                     task.created_at,
-                    task.updated_at,
                 ),
             )
             return cur.rowcount == 1
 
     def get_task(self, task_id: str) -> Task | None:
         with self._lock:
-            row = self._get_row(task_id)
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
             return self._row_to_task(row) if row else None
 
     def get_task_by_key(self, idempotency_key: str) -> Task | None:
@@ -124,32 +141,65 @@ class TaskStore:
             ).fetchone()
             return self._row_to_task(row) if row else None
 
-    def dead_letters(self) -> list[Task]:
+    # ---- 消费组处理状态 ----
+    def get_group_task(self, task_id: str, grp: str) -> GroupTask | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT gt.*, t.payload FROM group_tasks gt
+                   JOIN tasks t ON t.task_id = gt.task_id
+                   WHERE gt.task_id = ? AND gt.grp = ?""",
+                (task_id, grp),
+            ).fetchone()
+            return self._row_to_group_task(row) if row else None
+
+    def dead_letters(self, grp: str) -> list[GroupTask]:
+        """按组查询死信：一个组判死不影响其他组领取。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY seq",
-                (TaskStatus.DEAD.value,),
+                """SELECT gt.*, t.payload FROM group_tasks gt
+                   JOIN tasks t ON t.task_id = gt.task_id
+                   WHERE gt.grp = ? AND gt.status = ?
+                   ORDER BY gt.seq""",
+                (grp, TaskStatus.DEAD.value),
             ).fetchall()
-            return [self._row_to_task(r) for r in rows]
+            return [self._row_to_group_task(r) for r in rows]
 
     # ---- 租约 ----
     def acquire(
         self, group: str, consumer_id: str, now: float, lease_ttl: float
-    ) -> tuple[Task, int] | None:
-        """为消费组领取下一个可见任务，返回任务与 fencing token。
+    ) -> tuple[GroupTask, int] | None:
+        """为消费组领取下一个可处理任务，返回组状态（含 payload）与 fence。
 
-        可见 = PENDING/FAILED_RETRYABLE 且 visible_at 到期，
-        或 LEASED 但租约已过期（消费者中断后重新投递）。
-        同一任务同一时刻只会被一个租约持有，fence 单调递增。
+        可领取：
+        - 该组还没见过的任务（LEFT JOIN 缺失，领取时惰性建组状态行）；
+        - PENDING / FAILED_RETRYABLE 且 visible_at 到期；
+        - LEASED 但租约已过期（消费者掉线重投）。
+        同一 (任务, 组) 同一时刻只有一个租约；fence 单调递增。
+        租约到期重投不增加 attempts，failure_reason 记为 LEASE_EXPIRED，
+        与业务失败严格区分。
         """
         with self._lock, self._conn:
             row = self._conn.execute(
-                """SELECT * FROM tasks
-                   WHERE (status IN (?, ?) AND visible_at <= ?)
-                      OR (status = ? AND task_id IN
-                          (SELECT task_id FROM leases WHERE expires_at <= ?))
-                   ORDER BY seq LIMIT 1""",
+                """SELECT t.seq AS seq, t.task_id AS task_id, t.payload AS payload,
+                          t.max_attempts AS task_max_attempts, t.created_at AS task_created_at,
+                          gt.status AS status, gt.attempts AS attempts,
+                          gt.max_attempts AS max_attempts,
+                          gt.failure_reason AS failure_reason, gt.last_error AS last_error,
+                          gt.visible_at AS visible_at, gt.fence AS old_fence,
+                          gt.created_at AS gt_created_at, gt.updated_at AS gt_updated_at,
+                          l.expires_at AS lease_expires
+                   FROM tasks t
+                   LEFT JOIN group_tasks gt
+                       ON gt.task_id = t.task_id AND gt.grp = ?
+                   LEFT JOIN leases l
+                       ON l.task_id = t.task_id AND l.grp = ?
+                   WHERE gt.task_id IS NULL
+                      OR (gt.status IN (?, ?) AND gt.visible_at <= ?)
+                      OR (gt.status = ? AND l.expires_at <= ?)
+                   ORDER BY t.seq LIMIT 1""",
                 (
+                    group,
+                    group,
                     TaskStatus.PENDING.value,
                     TaskStatus.FAILED_RETRYABLE.value,
                     now,
@@ -159,38 +209,83 @@ class TaskStore:
             ).fetchone()
             if row is None:
                 return None
+
             task_id = row["task_id"]
-            old = self._conn.execute(
-                "SELECT fence FROM leases WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            fence = (old["fence"] if old else 0) + 1
+            fresh = row["status"] is None
+            expired = (not fresh) and row["status"] == TaskStatus.LEASED.value
+            old_fence = row["old_fence"] or 0
+            fence = old_fence + 1
+
+            if fresh:
+                # 惰性为该组建立独立处理进度
+                self._conn.execute(
+                    """INSERT INTO group_tasks
+                       (task_id, grp, seq, status, attempts, max_attempts,
+                        failure_reason, last_error, visible_at, fence,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 0, ?, 'NONE', NULL, ?, ?, ?, ?)""",
+                    (
+                        task_id, group, row["seq"], TaskStatus.LEASED.value,
+                        row["task_max_attempts"], now, fence, now, now,
+                    ),
+                )
+            else:
+                if expired:
+                    # 租约到期重投：只改状态/原因，不动 attempts
+                    self._conn.execute(
+                        """UPDATE group_tasks
+                           SET status = ?, failure_reason = ?, fence = ?,
+                               updated_at = ?
+                           WHERE task_id = ? AND grp = ?""",
+                        (
+                            TaskStatus.LEASED.value,
+                            FailureReason.LEASE_EXPIRED.value,
+                            fence, now, task_id, group,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """UPDATE group_tasks
+                           SET status = ?, fence = ?, updated_at = ?
+                           WHERE task_id = ? AND grp = ?""",
+                        (TaskStatus.LEASED.value, fence, now, task_id, group),
+                    )
+
             self._conn.execute(
                 """INSERT INTO leases (task_id, grp, consumer_id, fence, expires_at)
                    VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(task_id) DO UPDATE SET
-                       grp = excluded.grp,
+                   ON CONFLICT(task_id, grp) DO UPDATE SET
                        consumer_id = excluded.consumer_id,
                        fence = excluded.fence,
                        expires_at = excluded.expires_at""",
                 (task_id, group, consumer_id, fence, now + lease_ttl),
             )
-            self._conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-                (TaskStatus.LEASED.value, now, task_id),
-            )
-            task = self._row_to_task(self._get_row(task_id))
-            return task, fence
+
+            gt = self._conn.execute(
+                """SELECT gt.*, t.payload FROM group_tasks gt
+                   JOIN tasks t ON t.task_id = gt.task_id
+                   WHERE gt.task_id = ? AND gt.grp = ?""",
+                (task_id, group),
+            ).fetchone()
+            return self._row_to_group_task(gt, redelivered=expired), fence
 
     def ack(self, task_id: str, group: str, fence: int, now: float) -> None:
-        """确认成功：校验租约后标记成功并推进消费组位点。"""
+        """确认成功：校验租约后按组标记成功并推进该组位点。"""
         with self._lock, self._conn:
             self._check_lease(task_id, group, fence, now)
             self._conn.execute(
-                """UPDATE tasks SET status = ?, failure_reason = ?, last_error = NULL,
-                   updated_at = ? WHERE task_id = ?""",
-                (TaskStatus.SUCCEEDED.value, FailureReason.NONE.value, now, task_id),
+                """UPDATE group_tasks SET status = ?, failure_reason = ?,
+                   last_error = NULL, updated_at = ?
+                   WHERE task_id = ? AND grp = ?""",
+                (
+                    TaskStatus.SUCCEEDED.value, FailureReason.NONE.value,
+                    now, task_id, group,
+                ),
             )
-            self._conn.execute("DELETE FROM leases WHERE task_id = ?", (task_id,))
+            self._conn.execute(
+                "DELETE FROM leases WHERE task_id = ? AND grp = ?",
+                (task_id, group),
+            )
             self._advance_offset_locked(group)
 
     def fail(
@@ -204,35 +299,43 @@ class TaskStore:
         reason: str,
         error: str,
     ) -> None:
-        """确认失败：校验租约后重排可见时间或进入死信。"""
+        """确认业务失败：校验租约后按组退避重排或进入死信。"""
         with self._lock, self._conn:
             self._check_lease(task_id, group, fence, now)
             status = TaskStatus.DEAD if dead else TaskStatus.FAILED_RETRYABLE
             self._conn.execute(
-                """UPDATE tasks SET status = ?, attempts = attempts + 1,
+                """UPDATE group_tasks SET status = ?, attempts = attempts + 1,
                    failure_reason = ?, last_error = ?, visible_at = ?, updated_at = ?
-                   WHERE task_id = ?""",
-                (status.value, reason, error, visible_at, now, task_id),
+                   WHERE task_id = ? AND grp = ?""",
+                (status.value, reason, error, visible_at, now, task_id, group),
             )
-            self._conn.execute("DELETE FROM leases WHERE task_id = ?", (task_id,))
+            self._conn.execute(
+                "DELETE FROM leases WHERE task_id = ? AND grp = ?",
+                (task_id, group),
+            )
             if dead:
                 self._advance_offset_locked(group)
 
-    # ---- 位点 ----
+    # ---- 位点（按组）----
     def _advance_offset_locked(self, group: str) -> None:
-        """推进位点到已连续终结（成功或死信）的最大 seq。"""
+        """推进组位点到已连续终结（成功或死信）的最大 seq。"""
         row = self._conn.execute(
             "SELECT offset FROM offsets WHERE grp = ?", (group,)
         ).fetchone()
         current = row["offset"] if row else 0
         nxt = self._conn.execute(
-            """SELECT MIN(seq) AS gap FROM tasks
-               WHERE seq > ? AND status NOT IN (?, ?)""",
-            (current, TaskStatus.SUCCEEDED.value, TaskStatus.DEAD.value),
+            """SELECT MIN(gt.seq) AS gap FROM group_tasks gt
+               WHERE gt.grp = ? AND gt.seq > ?
+                 AND gt.status NOT IN (?, ?)""",
+            (group, current, *_TERMINAL),
         ).fetchone()["gap"]
-        target = (nxt - 1) if nxt is not None else self._conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS m FROM tasks"
-        ).fetchone()["m"]
+        if nxt is None:
+            target = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM group_tasks WHERE grp = ?",
+                (group,),
+            ).fetchone()["m"]
+        else:
+            target = nxt - 1
         if target > current:
             self._conn.execute(
                 """INSERT INTO offsets (grp, offset) VALUES (?, ?)
